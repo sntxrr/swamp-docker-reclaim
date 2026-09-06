@@ -558,7 +558,15 @@ export const model = {
   type: "@sntxrr/docker-reclaim/host",
   description:
     "Measure what a Docker host's disk is spent on, plan what can be freed without destroying a rollback target, and free it. Covers the build cache, which `docker image prune` never touches and which is usually most of the footprint.",
-  version: "2026.09.06.1",
+  version: "2026.09.06.2",
+  upgrades: [
+    {
+      toVersion: "2026.09.06.2",
+      description:
+        "Each resource now writes to its own data instance -- `usage`, `plan`, `reclaim` -- instead of all three sharing one called `current`. Sharing it meant data.latest(model, 'current') returned whichever METHOD ran last, with a different schema each time: a workflow guard reading .disk.usedPercent would find no such field after a reclaim, the expression would die during evaluation, and a step with allowFailure would then report SUCCEEDED having done nothing. Nothing to migrate -- global arguments are unchanged -- but expressions must move from data.latest(name, 'current') to data.latest(name, 'usage').",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   globalArguments: GlobalArgsSchema,
   resources: {
     usage: {
@@ -598,7 +606,7 @@ export const model = {
             free: humanBytes(usage.disk?.freeBytes ?? 0),
           },
         );
-        await context.writeResource("usage", "current", usage);
+        await context.writeResource("usage", "usage", usage);
         return usage;
       },
     },
@@ -635,7 +643,7 @@ export const model = {
             cache: humanBytes(buildCacheReclaimableBytes),
           },
         );
-        await context.writeResource("plan", "current", plan);
+        await context.writeResource("plan", "plan", plan);
         return plan;
       },
     },
@@ -671,7 +679,7 @@ export const model = {
             freeBytesAfter: before.disk?.freeBytes ?? 0,
             timestamp: new Date().toISOString(),
           };
-          await context.writeResource("reclaim", "current", result);
+          await context.writeResource("reclaim", "reclaim", result);
           return result;
         }
 
@@ -719,7 +727,7 @@ export const model = {
             after: humanBytes(freeAfter),
           },
         );
-        await context.writeResource("reclaim", "current", result);
+        await context.writeResource("reclaim", "reclaim", result);
         return result;
       },
     },

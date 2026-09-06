@@ -99,8 +99,10 @@ swamp model @sntxrr/docker-reclaim/host method run reclaim docker-host \
 
 ### Reclaim only when it is worth it
 
-`observe` writes a `usage` resource, so a workflow can gate on it with CEL
-rather than pruning on a blind schedule:
+Each method writes its own data instance — `usage`, `plan`, `reclaim` — so an
+expression always gets the schema it expects, whichever method ran last. A
+workflow can therefore gate on measured state rather than pruning on a blind
+schedule:
 
 ```yaml
 steps:
@@ -118,6 +120,20 @@ steps:
       data.latest("docker-host", "usage").attributes.disk.usedPercent > 80 &&
       data.latest("docker-host", "usage").attributes.totalReclaimableBytes > 5000000000
 ```
+
+## Data instances
+
+| Instance  | Written by | Holds |
+| --------- | ---------- | ----- |
+| `usage`   | `observe`  | Per-class sizes, reclaimable bytes, disk free. |
+| `plan`    | `plan`     | Removal candidates and protections. |
+| `reclaim` | `reclaim`  | What a reclaim actually did, and space measured freed. |
+
+They are deliberately separate. One shared instance would make
+`data.latest(model, "current")` return whichever *method* ran last, with a
+different schema each time — and an expression over a field that is missing
+dies during evaluation, which in a step with `allowFailure: true` reports
+SUCCEEDED while doing nothing.
 
 ## Global arguments
 
