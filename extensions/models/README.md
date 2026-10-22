@@ -97,6 +97,30 @@ swamp model @sntxrr/docker-reclaim/host method run reclaim docker-host \
   --arg apply=true
 ```
 
+### A Docker engine on this machine (`sshHost: local`)
+
+For a Docker engine on the machine swamp runs on — Docker Desktop on a
+workstation, say — there is no SSH server to reach. Set `sshHost` to the
+reserved word `local` and each command runs through `sh -c` as the invoking
+user instead. The commands are identical, so every protection below applies
+unchanged; only the transport differs. `sshUser` and the host key settings are
+ignored.
+
+Point `dataRoot` at the filesystem that actually backs the engine's storage.
+On Docker Desktop for macOS `/var/lib/docker` does not exist on the host; the
+disk image lives on the data volume, so use `/System/Volumes/Data`:
+
+```bash
+swamp model create @sntxrr/docker-reclaim/host workstation-docker \
+  --global-arg sshHost=local \
+  --global-arg dataRoot=/System/Volumes/Data
+```
+
+Docker Desktop's disk image is a sparse file. Space freed inside it reaches the
+host filesystem only as the engine releases blocks, which is why `reclaim`
+reports `freedBytes` from free space measured before and after, never from
+Docker's own "reclaimable" figure.
+
 ### Reclaim only when it is worth it
 
 Each method writes its own data instance — `usage`, `plan`, `reclaim` — so an
@@ -139,8 +163,8 @@ SUCCEEDED while doing nothing.
 
 | Argument | Default | Meaning |
 | -------- | ------- | ------- |
-| `sshHost` | *required* | Hostname or IP of the Docker host. **No default** — this model runs destructive commands, and a default host is a way to run them somewhere unintended. |
-| `sshUser` | `root` | SSH user. Needs to be able to talk to the Docker socket. |
+| `sshHost` | *required* | Hostname or IP of the Docker host, or `local` to run on this machine via `sh -c`. **No default** — this model runs destructive commands, and a default host is a way to run them somewhere unintended. |
+| `sshUser` | `root` | SSH user. Needs to be able to talk to the Docker socket. Ignored when `sshHost` is `local`. |
 | `keepVersions` | `2` | Newest tagged images kept per repository. `0` keeps none. |
 | `buildCacheKeepHours` | `168` | Keep build cache newer than this. `0` prunes all of it. |
 | `dataRoot` | `/var/lib/docker` | Path used to measure free space. Should be on the filesystem holding Docker's data root. |
@@ -162,7 +186,8 @@ every connection silently trusts whatever answers.
 ## Requirements
 
 - SSH access to the host, key-based (`BatchMode=yes` — a run will not sit on a
-  password prompt).
+  password prompt). Not needed with `sshHost: local`, where the invoking user
+  must be able to reach the local Docker socket instead.
 - The SSH user can reach the Docker socket, via the `docker` group or
   equivalent.
 - Docker CLI on the host supporting `docker system df --format`,

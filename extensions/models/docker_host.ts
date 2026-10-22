@@ -33,6 +33,13 @@
  * `StrictHostKeyChecking=no` is available but is not the default, because a
  * model whose whole purpose is to run destructive commands as a privileged
  * user is the last place to accept an unverified host key.
+ *
+ * The one exception is `sshHost: local`, for a Docker engine on the machine
+ * swamp itself runs on (Docker Desktop on a workstation, for one). There is no
+ * SSH server to reach and none should be required, so each command runs
+ * through `sh -c` as the invoking user. The commands, and therefore every
+ * protection above, are byte-for-byte the same in both modes; only the
+ * transport differs.
  */
 import { z } from "npm:zod@4";
 
@@ -342,6 +349,47 @@ export function sshArgs(
   return args;
 }
 
+/**
+ * The `sshHost` value that means "this machine": commands run locally through
+ * `sh -c` instead of over SSH. A reserved word rather than `localhost` on
+ * purpose — `localhost` is a real SSH destination some setups rely on, and
+ * changing what it means would silently change their transport.
+ */
+export const LOCAL_HOST = "local";
+
+/**
+ * The program and arguments that run `command` against the configured host.
+ *
+ * Local mode hands the command to `sh -c` verbatim, so the quoting the SSH
+ * path relies on (the remote shell parses the command string) is preserved:
+ * the same string means the same thing in both modes.
+ */
+export function execArgv(
+  g: {
+    sshHost: string;
+    sshUser: string;
+    strictHostKeyChecking?: string;
+    knownHostsFile?: string;
+  },
+  command: string,
+): { cmd: string; args: string[] } {
+  if (g.sshHost === LOCAL_HOST) {
+    return { cmd: "sh", args: ["-c", command] };
+  }
+  return {
+    cmd: "ssh",
+    args: sshArgs(g.sshHost, g.sshUser, command, {
+      strictHostKeyChecking: g.strictHostKeyChecking,
+      knownHostsFile: g.knownHostsFile,
+    }),
+  };
+}
+
+/** Where commands ran, for error messages: `user@host` or `local`. */
+export function targetLabel(g: { sshHost: string; sshUser: string }): string {
+  return g.sshHost === LOCAL_HOST ? LOCAL_HOST : `${g.sshUser}@${g.sshHost}`;
+}
+
 // ---------------------------------------------------------------------------
 // Host access
 // ---------------------------------------------------------------------------
@@ -362,13 +410,15 @@ interface ExecResult {
   stderr: string;
 }
 
-async function ssh(g: GlobalArgs, command: string): Promise<ExecResult> {
-  // @ts-ignore - Deno is provided by the swamp extension runtime
-  const proc = new Deno.Command("ssh", {
-    args: sshArgs(g.sshHost, g.sshUser, command, {
-      strictHostKeyChecking: g.strictHostKeyChecking,
-      knownHostsFile: g.knownHostsFile,
-    }),
+async function run(g: GlobalArgs, command: string): Promise<ExecResult> {
+  const { cmd, args } = execArgv(g, command);
+  // A subprocess is the transport itself: `ssh` to a remote engine, or `sh -c`
+  // for `sshHost: local`. Both are documented in the README; the program is
+  // fixed by execArgv, never taken from input.
+  // swamp-quality-ignore deno-command
+  const proc = new Deno.Command(cmd, {
+    args,
+    stdin: "null",
     stdout: "piped",
     stderr: "piped",
   });
@@ -381,13 +431,14 @@ async function ssh(g: GlobalArgs, command: string): Promise<ExecResult> {
 }
 
 /** Run a command and fail loudly. Used where a wrong answer is worse than an error. */
-async function sshOrThrow(g: GlobalArgs, command: string): Promise<string> {
-  const result = await ssh(g, command);
+async function runOrThrow(g: GlobalArgs, command: string): Promise<string> {
+  const result = await run(g, command);
   if (result.code !== 0) {
+    const via = g.sshHost === LOCAL_HOST ? "sh -c" : "ssh";
+    const where = `${via} ${targetLabel(g)}`;
+    const tail = result.stderr.trim().slice(-400);
     throw new Error(
-      `ssh ${g.sshUser}@${g.sshHost} failed (exit ${result.code}) running \`${command}\`: ${
-        result.stderr.trim().slice(-400)
-      }`,
+      `${where} failed (exit ${result.code}) running \`${command}\`: ${tail}`,
     );
   }
   return result.stdout;
@@ -395,9 +446,9 @@ async function sshOrThrow(g: GlobalArgs, command: string): Promise<string> {
 
 /** Read current usage: what Docker holds, and how much room is left for it. */
 async function readUsage(g: GlobalArgs) {
-  const dfJson = await sshOrThrow(g, "docker system df --format '{{json .}}'");
+  const dfJson = await runOrThrow(g, "docker system df --format '{{json .}}'");
   const rows = parseSystemDf(dfJson);
-  const diskOut = await sshOrThrow(g, `df -Pk ${g.dataRoot}`);
+  const diskOut = await runOrThrow(g, `df -Pk ${g.dataRoot}`);
   const disk = parseDf(diskOut, g.dataRoot);
 
   const byType = (type: string) =>
@@ -428,9 +479,9 @@ async function readUsage(g: GlobalArgs) {
  * created with — a tag that may since have moved to a different image.
  */
 async function inUseImageIds(g: GlobalArgs): Promise<Set<string>> {
-  const ids = (await sshOrThrow(g, "docker ps -aq")).trim();
+  const ids = (await runOrThrow(g, "docker ps -aq")).trim();
   if (!ids) return new Set();
-  const inspected = await sshOrThrow(
+  const inspected = await runOrThrow(
     g,
     `docker inspect --format '{{.Image}}' ${ids.split("\n").join(" ")}`,
   );
@@ -445,7 +496,7 @@ async function inUseImageIds(g: GlobalArgs): Promise<Set<string>> {
 }
 
 async function readImagePlan(g: GlobalArgs): Promise<ImagePlan> {
-  const listing = await sshOrThrow(
+  const listing = await runOrThrow(
     g,
     "docker images --format '{{.ID}}\\t{{.Repository}}\\t{{.Tag}}\\t{{.CreatedAt}}\\t{{.Size}}'",
   );
@@ -462,9 +513,11 @@ async function readImagePlan(g: GlobalArgs): Promise<ImagePlan> {
 
 const GlobalArgsSchema = z.object({
   sshHost: z.string().describe(
-    "Hostname or IP of the Docker host. No default: this model runs destructive commands, and a default host is a way to run them somewhere unintended.",
+    "Hostname or IP of the Docker host, or the reserved word `local` to run against the Docker engine on the machine swamp runs on (via `sh -c`, no SSH). No default: this model runs destructive commands, and a default host is a way to run them somewhere unintended.",
   ),
-  sshUser: z.string().default("root").describe("SSH user."),
+  sshUser: z.string().default("root").describe(
+    "SSH user. Ignored when sshHost is `local`, where commands run as the invoking user.",
+  ),
   keepVersions: z.number().int().min(0).default(2).describe(
     "Newest tagged images to keep per repository. These are the rollback targets — `docker image prune -a` removes them and this does not. 0 keeps none.",
   ),
@@ -558,12 +611,19 @@ export const model = {
   type: "@sntxrr/docker-reclaim/host",
   description:
     "Measure what a Docker host's disk is spent on, plan what can be freed without destroying a rollback target, and free it. Covers the build cache, which `docker image prune` never touches and which is usually most of the footprint.",
-  version: "2026.09.06.2",
+  version: "2026.10.22.1",
   upgrades: [
     {
       toVersion: "2026.09.06.2",
       description:
-        "Each resource now writes to its own data instance -- `usage`, `plan`, `reclaim` -- instead of all three sharing one called `current`. Sharing it meant data.latest(model, 'current') returned whichever METHOD ran last, with a different schema each time: a workflow guard reading .disk.usedPercent would find no such field after a reclaim, the expression would die during evaluation, and a step with allowFailure would then report SUCCEEDED having done nothing. Nothing to migrate -- global arguments are unchanged -- but expressions must move from data.latest(name, 'current') to data.latest(name, 'usage').",
+        "Each resource now writes to its own data instance -- `usage`, `plan`, `reclaim` -- instead of all three sharing one called `current`. Sharing it meant data.latest(model, 'current') returned whichever METHOD ran last, with a different schema each time: a workflow guard reading .disk.usedPercent would find no such field after a reclaim, the expression would die during evaluation, and a step with allowFailure would then report SUCCEEDED having done nothing." +
+        " Nothing to migrate -- global arguments are unchanged -- but expressions must move from data.latest(name, 'current') to data.latest(name, 'usage').",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.22.1",
+      description:
+        "Adds `sshHost: local`: commands run on the machine swamp runs on through `sh -c` instead of over SSH, for a Docker engine with no SSH server in front of it. Additive -- every existing value of sshHost keeps its meaning, the reclaim rules are unchanged, and there is nothing to migrate.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -691,7 +751,7 @@ export const model = {
           // image can legitimately refuse — another image may depend on its
           // layers. One refusal should not abandon the run.
           for (const candidate of imagePlan.remove) {
-            const result = await ssh(g, `docker rmi ${candidate.id}`);
+            const result = await run(g, `docker rmi ${candidate.id}`);
             if (result.code === 0) removed++;
             else failed++;
           }
@@ -700,7 +760,7 @@ export const model = {
         const untilFilter = g.buildCacheKeepHours > 0
           ? ` --filter until=${g.buildCacheKeepHours}h`
           : "";
-        await sshOrThrow(g, `docker builder prune -f${untilFilter}`);
+        await runOrThrow(g, `docker builder prune -f${untilFilter}`);
 
         const after = await readUsage(g);
         const freeBefore = before.disk?.freeBytes ?? 0;
