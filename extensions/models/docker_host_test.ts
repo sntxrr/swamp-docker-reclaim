@@ -1,7 +1,9 @@
 import { assertEquals } from "jsr:@std/assert@1";
 import {
+  execArgv,
   humanBytes,
   type ImageRow,
+  LOCAL_HOST,
   parseDf,
   parseImages,
   parseSize,
@@ -9,6 +11,7 @@ import {
   planImages,
   reclaimableOf,
   sshArgs,
+  targetLabel,
 } from "./docker_host.ts";
 
 // --- parseSize -------------------------------------------------------------
@@ -118,13 +121,17 @@ Deno.test("parseDf does not ceiling the way df prints", () => {
 });
 
 Deno.test("parseDf reports 0% for a filesystem with no blocks", () => {
-  const out = "Filesystem 1024-blocks Used Available Capacity Mounted on\ntmpfs 0 0 0 0% /empty";
+  const out =
+    "Filesystem 1024-blocks Used Available Capacity Mounted on\ntmpfs 0 0 0 0% /empty";
   assertEquals(parseDf(out, "/empty")?.usedPercent, 0);
 });
 
 Deno.test("parseDf returns null on output with no record", () => {
   assertEquals(parseDf("", "/"), null);
-  assertEquals(parseDf("Filesystem 1024-blocks Used Available Capacity", "/"), null);
+  assertEquals(
+    parseDf("Filesystem 1024-blocks Used Available Capacity", "/"),
+    null,
+  );
 });
 
 // --- parseImages -----------------------------------------------------------
@@ -260,7 +267,10 @@ Deno.test("sshArgs honours an explicit known_hosts file", () => {
   const args = sshArgs("host.example.com", "deploy", "true", {
     knownHostsFile: "/etc/swamp/known_hosts",
   });
-  assertEquals(args.includes("UserKnownHostsFile=/etc/swamp/known_hosts"), true);
+  assertEquals(
+    args.includes("UserKnownHostsFile=/etc/swamp/known_hosts"),
+    true,
+  );
 });
 
 Deno.test("sshArgs allows an explicit opt-out but only when asked", () => {
@@ -272,6 +282,52 @@ Deno.test("sshArgs allows an explicit opt-out but only when asked", () => {
 
 Deno.test("sshArgs runs non-interactively so a run cannot hang on a prompt", () => {
   assertEquals(sshArgs("h", "u", "true").includes("BatchMode=yes"), true);
+});
+
+// --- execArgv (transport) ---------------------------------------------------
+// `local` swaps the transport and nothing else. The command string must reach
+// the shell unchanged, or the quoting the SSH path relies on would change
+// meaning between modes.
+
+const remote = {
+  sshHost: "host.example.com",
+  sshUser: "deploy",
+  strictHostKeyChecking: "accept-new",
+};
+
+Deno.test("execArgv runs local commands through sh -c, verbatim", () => {
+  const cmd = "docker images --format '{{.ID}}\\t{{.Repository}}'";
+  const { cmd: prog, args } = execArgv(
+    { ...remote, sshHost: LOCAL_HOST },
+    cmd,
+  );
+  assertEquals(prog, "sh");
+  assertEquals(args, ["-c", cmd]);
+});
+
+Deno.test("execArgv local mode never invokes ssh or names the ssh user", () => {
+  const { cmd, args } = execArgv({ ...remote, sshHost: "local" }, "true");
+  assertEquals(cmd, "sh");
+  assertEquals(args.some((a) => a.includes("deploy")), false);
+});
+
+Deno.test("execArgv keeps the ssh path and its flags for any other host", () => {
+  const { cmd, args } = execArgv(remote, "docker ps");
+  assertEquals(cmd, "ssh");
+  assertEquals(args, sshArgs("host.example.com", "deploy", "docker ps"));
+});
+
+Deno.test("execArgv treats localhost as a real SSH destination", () => {
+  // Only the reserved word switches transport. `localhost` keeps meaning ssh.
+  assertEquals(
+    execArgv({ ...remote, sshHost: "localhost" }, "true").cmd,
+    "ssh",
+  );
+});
+
+Deno.test("targetLabel names the transport target", () => {
+  assertEquals(targetLabel(remote), "deploy@host.example.com");
+  assertEquals(targetLabel({ ...remote, sshHost: "local" }), "local");
 });
 
 // --- humanBytes ------------------------------------------------------------
