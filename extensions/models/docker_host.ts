@@ -32,7 +32,8 @@
  *    BuildKit regardless (a parent is not removed while a child is kept),
  *    which is why Docker's "reclaimable" build-cache figure overstates what
  *    any age-filtered prune frees.
- *    The prune names its builder: `--builder "$(docker context show)"`, the
+ *    The prune names its builder: `docker buildx prune --builder
+ *    "$(docker context show)"`, the
  *    `docker`-driver builder buildx keeps for the engine being measured. A
  *    bare `docker builder prune` goes to whichever builder is CURRENT, which
  *    can be a docker-container builder, or a docker-driver builder pointed at
@@ -415,11 +416,14 @@ export const ENGINE_BUILDER = `"$(docker context show)"`;
  * store, so an age-filtered prune frees nothing (header, point 2). The
  * `until` filter is what protects the working set; 0 hours drops it.
  * `--builder` pins the prune to the engine being measured, not whichever
- * builder happens to be current.
+ * builder happens to be current. It is `docker buildx prune`, not `docker
+ * builder prune`: the latter falls back to the legacy builder (no `--builder`
+ * flag) under DOCKER_BUILDKIT=0 or an old engine, so the `engine-builder`
+ * check and the prune must go through the same buildx binary.
  */
 export function builderPruneCommand(keepHours: number): string {
   const untilFilter = keepHours > 0 ? ` --filter until=${keepHours}h` : "";
-  return `docker builder prune --builder ${ENGINE_BUILDER} -af${untilFilter}`;
+  return `docker buildx prune --builder ${ENGINE_BUILDER} -af${untilFilter}`;
 }
 
 /** The read-only command the `engine-builder` check runs. */
@@ -719,7 +723,7 @@ export const model = {
     {
       toVersion: "2026.10.24.2",
       description:
-        'The build-cache prune names its builder (`--builder "$(docker context show)"`) instead of using whichever buildx builder is current, and a new `engine-builder` pre-flight check (label `live`) refuses `reclaim` unless that builder exists and uses the docker driver. A host whose CLI lacks buildx, or whose context has no docker-driver builder, now fails reclaim with that reason instead of pruning; skip with --skip-check engine-builder only if you know where the prune lands. Nothing to migrate.',
+        'The build-cache prune is now `docker buildx prune --builder "$(docker context show)" -af ...`, naming the engine\'s own builder instead of whichever buildx builder is current, and it runs before any image removal so a failed prune deletes nothing; and a new `engine-builder` pre-flight check (label `live`) refuses `reclaim` unless that builder exists and uses the docker driver. A host whose CLI lacks buildx, or whose context has no docker-driver builder, now fails reclaim with that reason instead of pruning; skip with --skip-check engine-builder only if you know where the prune lands. Nothing to migrate.',
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -863,6 +867,12 @@ export const model = {
           return result;
         }
 
+        // Build cache first. It is the step that can fail outright (a missing
+        // builder, an unknown flag), and failing it before any `docker rmi`
+        // means a refused run has deleted nothing rather than half its plan
+        // with no record written.
+        await runOrThrow(g, exec, builderPruneCommand(g.buildCacheKeepHours));
+
         let removed = 0;
         let failed = 0;
         if (imagePlan.remove.length > 0) {
@@ -876,8 +886,6 @@ export const model = {
             else failed++;
           }
         }
-
-        await runOrThrow(g, exec, builderPruneCommand(g.buildCacheKeepHours));
 
         const after = await readUsage(g, exec);
         const freeBefore = before.disk?.freeBytes ?? 0;

@@ -46,7 +46,7 @@ bound, not what a reclaim will free.
 can be a `docker-container` builder, or a `docker`-driver builder pointed at
 *another host's* engine, and the prune would then delete cache somewhere this
 model never measured. The prune therefore names the engine's own builder,
-`--builder "$(docker context show)"` (buildx names each context's
+`docker buildx prune --builder "$(docker context show)"` (buildx names each context's
 docker-driver builder after the context), and the `engine-builder` pre-flight
 check below refuses `reclaim` unless that builder exists and uses the `docker`
 driver.
@@ -217,10 +217,14 @@ every connection silently trusts whatever answers.
 - The SSH user can reach the Docker socket, via the `docker` group or
   equivalent.
 - Docker CLI on the host supporting `docker system df --format`,
-  `docker images --format` and `docker context show`, with the buildx plugin
-  (`docker buildx inspect`, `docker builder prune --builder -a --filter`).
-  Docker Engine 23+ and Docker Desktop ship it; on a distribution package it
-  may be separate (`docker-buildx`).
+  `docker images --format` and `docker context show`, plus the buildx plugin:
+  `reclaim` runs `docker buildx inspect` and `docker buildx prune` (with
+  `--builder`, `-a` and `--filter`). Docker Desktop bundles buildx; on Linux it
+  is usually a separate package (`docker-buildx-plugin` from Docker's
+  repository, `docker-buildx` on some distributions).
+- A POSIX login shell for the SSH user (sh, bash, zsh, …). Commands use
+  `$(...)`, which csh and tcsh reject; the `engine-builder` check then refuses
+  with the shell's error rather than running anything.
 
 ## What it does not do
 

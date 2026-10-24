@@ -353,14 +353,14 @@ Deno.test("humanBytes renders round units", () => {
 Deno.test("builderPruneCommand keeps -a and the age filter", () => {
   assertEquals(
     builderPruneCommand(168),
-    'docker builder prune --builder "$(docker context show)" -af --filter until=168h',
+    'docker buildx prune --builder "$(docker context show)" -af --filter until=168h',
   );
 });
 
 Deno.test("builderPruneCommand with 0 hours prunes all unused cache", () => {
   assertEquals(
     builderPruneCommand(0),
-    'docker builder prune --builder "$(docker context show)" -af',
+    'docker buildx prune --builder "$(docker context show)" -af',
   );
 });
 
@@ -422,7 +422,7 @@ function fakeHost(overrides: Record<string, ExecResult> = {}) {
     ["docker ps -aq", ok("c1\n")],
     ["docker inspect", ok("sha256:aaa000000001" + "f".repeat(52) + "\n")],
     ["docker rmi", ok("")],
-    ["docker builder prune", ok("Total: 1.3GB")],
+    ["docker buildx prune", ok("Total: 1.3GB")],
     [ENGINE_BUILDER_INSPECT, ok("Name: default\nDriver: docker\n")],
   ];
   const exec: Exec = (command) => {
@@ -468,14 +468,14 @@ Deno.test("reclaim without apply sends no destructive command", async () => {
   assertEquals(writes[0].data.applied, false);
 });
 
-Deno.test("reclaim removes only planned images, then prunes the engine's cache", async () => {
+Deno.test("reclaim prunes the engine's cache, then removes only planned images", async () => {
   const { exec, calls } = fakeHost();
   const { context, writes } = fakeContext(exec);
   await model.methods.reclaim.execute({ apply: true }, context);
   assertEquals(destructive(calls), [
+    builderPruneCommand(168),
     "docker rmi aaa000000003",
     "docker rmi bbb000000001",
-    builderPruneCommand(168),
   ]);
   assertEquals(writes[0].data.applied, true);
   assertEquals(writes[0].data.imagesRemoved, 2);
@@ -495,9 +495,9 @@ Deno.test("reclaim counts a refused rmi and carries on", async () => {
   assertEquals(writes[0].data.imagesFailed, 1);
 });
 
-Deno.test("reclaim throws before writing when the prune fails", async () => {
-  const { exec } = fakeHost({
-    "docker builder prune": { code: 1, stdout: "", stderr: "no such builder" },
+Deno.test("reclaim deletes no image and writes nothing when the prune fails", async () => {
+  const { exec, calls } = fakeHost({
+    "docker buildx prune": { code: 1, stdout: "", stderr: "no such builder" },
   });
   const { context, writes } = fakeContext(exec);
   await assertRejects(
@@ -505,6 +505,7 @@ Deno.test("reclaim throws before writing when the prune fails", async () => {
     Error,
     "no such builder",
   );
+  assertEquals(destructive(calls), [builderPruneCommand(168)]);
   assertEquals(writes, []);
 });
 
