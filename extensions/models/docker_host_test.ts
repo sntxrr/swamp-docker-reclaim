@@ -1,5 +1,6 @@
 import { assertEquals } from "jsr:@std/assert@1";
 import {
+  builderPruneCommand,
   execArgv,
   humanBytes,
   type ImageRow,
@@ -337,4 +338,20 @@ Deno.test("humanBytes renders round units", () => {
   assertEquals(humanBytes(-5), "0 B");
   assertEquals(humanBytes(512), "512 B");
   assertEquals(humanBytes(59_530_000_000), "59.53 GB");
+});
+
+// --- builderPruneCommand ---------------------------------------------------
+// Without `-a` the prune skips records shared with the image store and frees
+// nothing on a Docker engine; the age filter is the only guard on the working
+// set. Both halves are pinned so neither can be dropped quietly.
+
+Deno.test("builderPruneCommand keeps -a and the age filter", () => {
+  assertEquals(
+    builderPruneCommand(168),
+    "docker builder prune -af --filter until=168h",
+  );
+});
+
+Deno.test("builderPruneCommand with 0 hours prunes all unused cache", () => {
+  assertEquals(builderPruneCommand(0), "docker builder prune -af");
 });
