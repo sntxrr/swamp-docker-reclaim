@@ -723,7 +723,8 @@ export const model = {
     {
       toVersion: "2026.10.24.2",
       description:
-        'The build-cache prune is now `docker buildx prune --builder "$(docker context show)" -af ...`, naming the engine\'s own builder instead of whichever buildx builder is current, and it runs before any image removal so a failed prune deletes nothing; and a new `engine-builder` pre-flight check (label `live`) refuses `reclaim` unless that builder exists and uses the docker driver. A host whose CLI lacks buildx, or whose context has no docker-driver builder, now fails reclaim with that reason instead of pruning; skip with --skip-check engine-builder only if you know where the prune lands. Nothing to migrate.',
+        'The build-cache prune is now `docker buildx prune --builder "$(docker context show)" -af ...`, naming the engine\'s own builder instead of whichever buildx builder is current, and it runs before any image removal so a failed prune deletes nothing; and a new `engine-builder` pre-flight check (label `live`) refuses `reclaim` unless that builder exists and uses the docker driver.' +
+        " A host whose CLI lacks buildx, or whose context has no docker-driver builder, now fails reclaim with that reason instead of pruning; skip with --skip-check engine-builder only if you know where the prune lands. Nothing to migrate.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
