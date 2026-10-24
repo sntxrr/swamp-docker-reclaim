@@ -32,6 +32,13 @@
  *    BuildKit regardless (a parent is not removed while a child is kept),
  *    which is why Docker's "reclaimable" build-cache figure overstates what
  *    any age-filtered prune frees.
+ *    The prune names its builder: `--builder "$(docker context show)"`, the
+ *    `docker`-driver builder buildx keeps for the engine being measured. A
+ *    bare `docker builder prune` goes to whichever builder is CURRENT, which
+ *    can be a docker-container builder, or a docker-driver builder pointed at
+ *    another host's engine; it would then delete cache somewhere this model
+ *    never measured. The `engine-builder` pre-flight check refuses `reclaim`
+ *    when that builder is missing or not the engine's own.
  *
  * 3. **Sizes reported by Docker are human strings, and they round.** "59.53GB"
  *    is not a byte count and 1000 vs 1024 is a real 7% at terabyte scale.
@@ -395,18 +402,49 @@ export function execArgv(
   };
 }
 
-/** Where commands ran, for error messages: `user@host` or `local`. */
+/**
+ * The engine's own builder: buildx names the `docker`-driver builder for each
+ * context after the context. Evaluated by the target's shell, so it resolves
+ * on the host being reclaimed, over SSH or locally.
+ */
+export const ENGINE_BUILDER = `"$(docker context show)"`;
+
 /**
  * The build-cache prune `reclaim` runs. `-a` is required: without it BuildKit
  * leaves out internal/frontend records and records shared with the image
  * store, so an age-filtered prune frees nothing (header, point 2). The
  * `until` filter is what protects the working set; 0 hours drops it.
+ * `--builder` pins the prune to the engine being measured, not whichever
+ * builder happens to be current.
  */
 export function builderPruneCommand(keepHours: number): string {
   const untilFilter = keepHours > 0 ? ` --filter until=${keepHours}h` : "";
-  return `docker builder prune -af${untilFilter}`;
+  return `docker builder prune --builder ${ENGINE_BUILDER} -af${untilFilter}`;
 }
 
+/** The read-only command the `engine-builder` check runs. */
+export const ENGINE_BUILDER_INSPECT = `docker buildx inspect ${ENGINE_BUILDER}`;
+
+/**
+ * Why the engine's builder cannot be pruned safely, or null when it can.
+ * Takes the result of ENGINE_BUILDER_INSPECT. Fails closed: anything other
+ * than a successful inspect reporting the `docker` driver is a refusal.
+ */
+export function engineBuilderProblem(result: ExecResult): string | null {
+  if (result.code !== 0) {
+    const tail = result.stderr.trim().slice(-300) || "no output";
+    return `\`${ENGINE_BUILDER_INSPECT}\` failed (exit ${result.code}): ${tail}. reclaim prunes build cache with \`--builder\` naming the engine's own builder, which needs buildx and a builder named after the current docker context.`;
+  }
+  const driver = result.stdout.match(/^Driver:\s*(\S+)/m)?.[1];
+  if (driver !== "docker") {
+    return `the builder named after the current docker context uses driver "${
+      driver ?? "unknown"
+    }", not "docker". Its cache is not the engine's build cache that this model measures, so reclaim will not prune it.`;
+  }
+  return null;
+}
+
+/** Where commands ran, for error messages: `user@host` or `local`. */
 export function targetLabel(g: { sshHost: string; sshUser: string }): string {
   return g.sshHost === LOCAL_HOST ? LOCAL_HOST : `${g.sshUser}@${g.sshHost}`;
 }
@@ -425,10 +463,22 @@ interface GlobalArgs {
   knownHostsFile?: string;
 }
 
-interface ExecResult {
+export interface ExecResult {
   code: number;
   stdout: string;
   stderr: string;
+}
+
+/**
+ * Runs one command against the configured host. Methods and the check take
+ * it from `context._exec` when present, which only tests set; otherwise it
+ * is `run` bound to the global arguments. Every command still goes through
+ * this one function, so a test sees exactly what a host would be sent.
+ */
+export type Exec = (command: string) => Promise<ExecResult>;
+
+function hostExec(g: GlobalArgs, override?: Exec): Exec {
+  return override ?? ((command) => run(g, command));
 }
 
 async function run(g: GlobalArgs, command: string): Promise<ExecResult> {
@@ -452,8 +502,12 @@ async function run(g: GlobalArgs, command: string): Promise<ExecResult> {
 }
 
 /** Run a command and fail loudly. Used where a wrong answer is worse than an error. */
-async function runOrThrow(g: GlobalArgs, command: string): Promise<string> {
-  const result = await run(g, command);
+async function runOrThrow(
+  g: GlobalArgs,
+  exec: Exec,
+  command: string,
+): Promise<string> {
+  const result = await exec(command);
   if (result.code !== 0) {
     const via = g.sshHost === LOCAL_HOST ? "sh -c" : "ssh";
     const where = `${via} ${targetLabel(g)}`;
@@ -466,10 +520,14 @@ async function runOrThrow(g: GlobalArgs, command: string): Promise<string> {
 }
 
 /** Read current usage: what Docker holds, and how much room is left for it. */
-async function readUsage(g: GlobalArgs) {
-  const dfJson = await runOrThrow(g, "docker system df --format '{{json .}}'");
+async function readUsage(g: GlobalArgs, exec: Exec) {
+  const dfJson = await runOrThrow(
+    g,
+    exec,
+    "docker system df --format '{{json .}}'",
+  );
   const rows = parseSystemDf(dfJson);
-  const diskOut = await runOrThrow(g, `df -Pk ${g.dataRoot}`);
+  const diskOut = await runOrThrow(g, exec, `df -Pk ${g.dataRoot}`);
   const disk = parseDf(diskOut, g.dataRoot);
 
   const byType = (type: string) =>
@@ -499,11 +557,12 @@ async function readUsage(g: GlobalArgs) {
  * `Image` column of `docker ps`, which prints whatever name the container was
  * created with — a tag that may since have moved to a different image.
  */
-async function inUseImageIds(g: GlobalArgs): Promise<Set<string>> {
-  const ids = (await runOrThrow(g, "docker ps -aq")).trim();
+async function inUseImageIds(g: GlobalArgs, exec: Exec): Promise<Set<string>> {
+  const ids = (await runOrThrow(g, exec, "docker ps -aq")).trim();
   if (!ids) return new Set();
   const inspected = await runOrThrow(
     g,
+    exec,
     `docker inspect --format '{{.Image}}' ${ids.split("\n").join(" ")}`,
   );
   const short = new Set<string>();
@@ -516,14 +575,15 @@ async function inUseImageIds(g: GlobalArgs): Promise<Set<string>> {
   return short;
 }
 
-async function readImagePlan(g: GlobalArgs): Promise<ImagePlan> {
+async function readImagePlan(g: GlobalArgs, exec: Exec): Promise<ImagePlan> {
   const listing = await runOrThrow(
     g,
+    exec,
     "docker images --format '{{.ID}}\\t{{.Repository}}\\t{{.Tag}}\\t{{.CreatedAt}}\\t{{.Size}}'",
   );
   return planImages(
     parseImages(listing),
-    await inUseImageIds(g),
+    await inUseImageIds(g, exec),
     g.keepVersions,
   );
 }
@@ -616,6 +676,8 @@ const ReclaimSchema = z.object({
 
 interface Context {
   globalArgs: GlobalArgs;
+  /** Test seam only; swamp never sets it. See `Exec`. */
+  _exec?: Exec;
   logger: { info: (msg: string, meta?: Record<string, unknown>) => void };
   writeResource: (
     resource: string,
@@ -632,7 +694,7 @@ export const model = {
   type: "@sntxrr/docker-reclaim/host",
   description:
     "Measure what a Docker host's disk is spent on, plan what can be freed without destroying a rollback target, and free it. Covers the build cache, which `docker image prune` never touches and which is usually most of the footprint.",
-  version: "2026.10.24.1",
+  version: "2026.10.24.2",
   upgrades: [
     {
       toVersion: "2026.09.06.2",
@@ -654,8 +716,32 @@ export const model = {
         " buildCacheKeepHours: 0 now really prunes all unused build cache, as documented. Nothing to migrate.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
+    {
+      toVersion: "2026.10.24.2",
+      description:
+        'The build-cache prune names its builder (`--builder "$(docker context show)"`) instead of using whichever buildx builder is current, and a new `engine-builder` pre-flight check (label `live`) refuses `reclaim` unless that builder exists and uses the docker driver. A host whose CLI lacks buildx, or whose context has no docker-driver builder, now fails reclaim with that reason instead of pruning; skip with --skip-check engine-builder only if you know where the prune lands. Nothing to migrate.',
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
   ],
   globalArguments: GlobalArgsSchema,
+  checks: {
+    "engine-builder": {
+      description:
+        "Before reclaim: the builder named after the current docker context exists and uses the docker driver, so the build-cache prune lands on the engine this model measures.",
+      labels: ["live"],
+      appliesTo: ["reclaim"],
+      execute: async (
+        context: { globalArgs: GlobalArgs; _exec?: Exec },
+      ): Promise<{ pass: boolean; errors?: string[] }> => {
+        const g = context.globalArgs;
+        const result = await hostExec(g, context._exec)(ENGINE_BUILDER_INSPECT);
+        const problem = engineBuilderProblem(result);
+        return problem
+          ? { pass: false, errors: [`${targetLabel(g)}: ${problem}`] }
+          : { pass: true };
+      },
+    },
+  },
   resources: {
     usage: {
       description:
@@ -685,7 +771,8 @@ export const model = {
         "Read-only. Report what Docker holds and how much of it is reclaimable, plus free space on the data root. Safe to schedule as often as you like; this is the number to assert a threshold against.",
       arguments: z.object({}),
       execute: async (_args: unknown, context: Context) => {
-        const usage = await readUsage(context.globalArgs);
+        const exec = hostExec(context.globalArgs, context._exec);
+        const usage = await readUsage(context.globalArgs, exec);
         context.logger.info(
           "{host}: {reclaimable} reclaimable, {free} free",
           {
@@ -701,11 +788,13 @@ export const model = {
 
     plan: {
       description:
-        "Read-only. Report exactly which images would be removed and which are protected, and how much build cache is old enough to prune. Removes nothing.",
+        "Read-only. Report exactly which images would be removed and which are protected, and Docker's reclaimable build-cache figure, an upper bound on what the age-filtered prune frees. Removes nothing.",
       arguments: z.object({}),
       execute: async (_args: unknown, context: Context) => {
         const g = context.globalArgs;
-        const [imagePlan, usage] = [await readImagePlan(g), await readUsage(g)];
+        const exec = hostExec(g, context._exec);
+        const imagePlan = await readImagePlan(g, exec);
+        const usage = await readUsage(g, exec);
         const buildCacheReclaimableBytes = usage.buildCache.reclaimableBytes;
 
         const plan = {
@@ -746,8 +835,9 @@ export const model = {
       }),
       execute: async (args: { apply: boolean }, context: Context) => {
         const g = context.globalArgs;
-        const before = await readUsage(g);
-        const imagePlan = await readImagePlan(g);
+        const exec = hostExec(g, context._exec);
+        const before = await readUsage(g, exec);
+        const imagePlan = await readImagePlan(g, exec);
 
         if (!args.apply) {
           context.logger.info(
@@ -781,15 +871,15 @@ export const model = {
           // image can legitimately refuse — another image may depend on its
           // layers. One refusal should not abandon the run.
           for (const candidate of imagePlan.remove) {
-            const result = await run(g, `docker rmi ${candidate.id}`);
+            const result = await exec(`docker rmi ${candidate.id}`);
             if (result.code === 0) removed++;
             else failed++;
           }
         }
 
-        await runOrThrow(g, builderPruneCommand(g.buildCacheKeepHours));
+        await runOrThrow(g, exec, builderPruneCommand(g.buildCacheKeepHours));
 
-        const after = await readUsage(g);
+        const after = await readUsage(g, exec);
         const freeBefore = before.disk?.freeBytes ?? 0;
         const freeAfter = after.disk?.freeBytes ?? 0;
 
