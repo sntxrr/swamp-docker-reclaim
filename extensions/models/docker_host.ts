@@ -22,6 +22,13 @@
  *    build fast.** Cache that is minutes old is the most valuable cache
  *    there is. Pruning is therefore age-filtered (`--filter until=`), so a
  *    scheduled run reclaims cold layers and leaves the working set alone.
+ *    The filter is the guard, and `-a` stays ON: without it buildx prunes
+ *    only the internal/frontend records, so an age-filtered prune with no
+ *    `-a` removed 0B from 12.6 GB of cache untouched for 2 weeks to 6 months.
+ *    Old layers that a recent build still sits on top of are kept by
+ *    BuildKit regardless (a parent is not removed while a child is kept),
+ *    which is why Docker's "reclaimable" build-cache figure overstates what
+ *    any age-filtered prune frees.
  *
  * 3. **Sizes reported by Docker are human strings, and they round.** "59.53GB"
  *    is not a byte count and 1000 vs 1024 is a real 7% at terabyte scale.
@@ -757,10 +764,12 @@ export const model = {
           }
         }
 
+        // `-a` is required: without it the age filter only reaches
+        // internal/frontend records and frees nothing (header, point 2).
         const untilFilter = g.buildCacheKeepHours > 0
           ? ` --filter until=${g.buildCacheKeepHours}h`
           : "";
-        await runOrThrow(g, `docker builder prune -f${untilFilter}`);
+        await runOrThrow(g, `docker builder prune -af${untilFilter}`);
 
         const after = await readUsage(g);
         const freeBefore = before.disk?.freeBytes ?? 0;
