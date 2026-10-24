@@ -36,6 +36,11 @@ quietly cost you the ability to go back.
 fast.** Cache that is minutes old is the most valuable cache there is. Pruning
 here is age-filtered (`--filter until=`), so a scheduled run takes cold layers
 and leaves the working set alone.
+The prune does run with `-a`: without it BuildKit leaves out records shared
+with the image store, and on a Docker engine an age-filtered prune then frees
+almost nothing. Old layers that a recent build still sits on are kept by
+BuildKit either way, so Docker's "reclaimable" build-cache figure is an upper
+bound, not what a reclaim will free.
 
 **Docker's sizes are rounded human strings.** `59.53GB` is not a byte count,
 and SI vs. binary is a real 7% at terabyte scale. Parsing is explicit and
@@ -191,7 +196,7 @@ every connection silently trusts whatever answers.
 - The SSH user can reach the Docker socket, via the `docker` group or
   equivalent.
 - Docker CLI on the host supporting `docker system df --format`,
-  `docker builder prune --filter` and `docker images --format`.
+  `docker builder prune -a --filter` and `docker images --format`.
 
 ## What it does not do
 

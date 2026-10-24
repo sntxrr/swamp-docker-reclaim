@@ -22,9 +22,12 @@
  *    build fast.** Cache that is minutes old is the most valuable cache
  *    there is. Pruning is therefore age-filtered (`--filter until=`), so a
  *    scheduled run reclaims cold layers and leaves the working set alone.
- *    The filter is the guard, and `-a` stays ON: without it buildx prunes
- *    only the internal/frontend records, so an age-filtered prune with no
- *    `-a` removed 0B from 12.6 GB of cache untouched for 2 weeks to 6 months.
+ *    The filter is the guard, and `-a` stays ON. Without `-a`, BuildKit
+ *    leaves out internal/frontend records and records whose layers are
+ *    shared with the image store, which on a Docker engine is most of the
+ *    cache: measured, an age-filtered prune with no `-a` removed 0B from
+ *    12.6 GB of cache untouched for 2 weeks to 6 months; with `-a` and the
+ *    same filter it freed what was actually cold.
  *    Old layers that a recent build still sits on top of are kept by
  *    BuildKit regardless (a parent is not removed while a child is kept),
  *    which is why Docker's "reclaimable" build-cache figure overstates what
@@ -393,6 +396,17 @@ export function execArgv(
 }
 
 /** Where commands ran, for error messages: `user@host` or `local`. */
+/**
+ * The build-cache prune `reclaim` runs. `-a` is required: without it BuildKit
+ * leaves out internal/frontend records and records shared with the image
+ * store, so an age-filtered prune frees nothing (header, point 2). The
+ * `until` filter is what protects the working set; 0 hours drops it.
+ */
+export function builderPruneCommand(keepHours: number): string {
+  const untilFilter = keepHours > 0 ? ` --filter until=${keepHours}h` : "";
+  return `docker builder prune -af${untilFilter}`;
+}
+
 export function targetLabel(g: { sshHost: string; sshUser: string }): string {
   return g.sshHost === LOCAL_HOST ? LOCAL_HOST : `${g.sshUser}@${g.sshHost}`;
 }
@@ -618,7 +632,7 @@ export const model = {
   type: "@sntxrr/docker-reclaim/host",
   description:
     "Measure what a Docker host's disk is spent on, plan what can be freed without destroying a rollback target, and free it. Covers the build cache, which `docker image prune` never touches and which is usually most of the footprint.",
-  version: "2026.10.22.1",
+  version: "2026.10.24.1",
   upgrades: [
     {
       toVersion: "2026.09.06.2",
@@ -631,6 +645,13 @@ export const model = {
       toVersion: "2026.10.22.1",
       description:
         "Adds `sshHost: local`: commands run on the machine swamp runs on through `sh -c` instead of over SSH, for a Docker engine with no SSH server in front of it. Additive -- every existing value of sshHost keeps its meaning, the reclaim rules are unchanged, and there is nothing to migrate.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.24.1",
+      description:
+        "`reclaim` now prunes build cache with `docker builder prune -af --filter until=<buildCacheKeepHours>h`. Before, the prune ran without `-a`, which leaves out records shared with the image store, and on a Docker engine it freed close to nothing. Expect a scheduled reclaim to delete cold build cache it used to leave alone; cache used within buildCacheKeepHours is still kept, and BuildKit keeps old layers that recent builds sit on." +
+        " buildCacheKeepHours: 0 now really prunes all unused build cache, as documented. Nothing to migrate.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -730,11 +751,13 @@ export const model = {
 
         if (!args.apply) {
           context.logger.info(
-            "Dry run. Would remove {count} images ({bytes}) and build cache older than {hours}h. Pass apply=true to act.",
+            "Dry run. Would remove {count} images ({bytes}) and {cache}. Pass apply=true to act.",
             {
               count: imagePlan.remove.length,
               bytes: humanBytes(imagePlan.removeBytes),
-              hours: g.buildCacheKeepHours,
+              cache: g.buildCacheKeepHours > 0
+                ? `build cache unused for ${g.buildCacheKeepHours}h`
+                : "all unused build cache",
             },
           );
           const result = {
@@ -764,12 +787,7 @@ export const model = {
           }
         }
 
-        // `-a` is required: without it the age filter only reaches
-        // internal/frontend records and frees nothing (header, point 2).
-        const untilFilter = g.buildCacheKeepHours > 0
-          ? ` --filter until=${g.buildCacheKeepHours}h`
-          : "";
-        await runOrThrow(g, `docker builder prune -af${untilFilter}`);
+        await runOrThrow(g, builderPruneCommand(g.buildCacheKeepHours));
 
         const after = await readUsage(g);
         const freeBefore = before.disk?.freeBytes ?? 0;
