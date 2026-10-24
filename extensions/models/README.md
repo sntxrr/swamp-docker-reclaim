@@ -42,6 +42,15 @@ almost nothing. Old layers that a recent build still sits on are kept by
 BuildKit either way, so Docker's "reclaimable" build-cache figure is an upper
 bound, not what a reclaim will free.
 
+**A bare `docker builder prune` goes to whichever builder is current.** That
+can be a `docker-container` builder, or a `docker`-driver builder pointed at
+*another host's* engine, and the prune would then delete cache somewhere this
+model never measured. The prune therefore names the engine's own builder,
+`docker buildx prune --builder "$(docker context show)"` (buildx names each context's
+docker-driver builder after the context), and the `engine-builder` pre-flight
+check below refuses `reclaim` unless that builder exists and uses the `docker`
+driver.
+
 **Docker's sizes are rounded human strings.** `59.53GB` is not a byte count,
 and SI vs. binary is a real 7% at terabyte scale. Parsing is explicit and
 unit-aware, and the freed figure `reclaim` reports is *measured* — free space
@@ -52,13 +61,25 @@ observed before and after — not a sum of estimates.
 | Method    | Writes? | Effect |
 | --------- | ------- | ------ |
 | `observe` | no      | Reports what Docker holds by class, how much is reclaimable, and free space on the data root. |
-| `plan`    | no      | Reports exactly which images would be removed, which are protected and why, and how much build cache is old enough to prune. |
+| `plan`    | no      | Reports exactly which images would be removed, which are protected and why, and Docker's reclaimable build-cache figure (an upper bound on what the age-filtered prune frees). |
 | `reclaim` | **yes** | Frees space. Dry-run unless passed `apply: true`. |
 
 `observe` is the one to schedule. It is read-only, cheap, and produces the
 number you assert a threshold against — so a workflow can prune only when the
 host actually needs it, rather than on a timer that fires whether or not there
 is anything to reclaim.
+
+## Pre-flight check
+
+| Check | Label | Runs before | Refuses when |
+| ----- | ----- | ----------- | ------------ |
+| `engine-builder` | `live` | `reclaim` (dry runs too) | `docker buildx inspect "$(docker context show)"` fails, or reports a driver other than `docker`. |
+
+Skip it with `--skip-check engine-builder` (or `--skip-check-label live`) only
+when you know where the prune lands. swamp does not run pre-flight checks for a
+workflow step placed on a worker; the `--builder` pin in the command still
+applies there, so the prune cannot drift to another builder, but a host
+without buildx then fails at the prune instead of at the check.
 
 ## What is never removed
 
@@ -196,7 +217,14 @@ every connection silently trusts whatever answers.
 - The SSH user can reach the Docker socket, via the `docker` group or
   equivalent.
 - Docker CLI on the host supporting `docker system df --format`,
-  `docker builder prune -a --filter` and `docker images --format`.
+  `docker images --format` and `docker context show`, plus the buildx plugin:
+  `reclaim` runs `docker buildx inspect` and `docker buildx prune` (with
+  `--builder`, `-a` and `--filter`). Docker Desktop bundles buildx; on Linux it
+  is usually a separate package (`docker-buildx-plugin` from Docker's
+  repository, `docker-buildx` on some distributions).
+- A POSIX login shell for the SSH user (sh, bash, zsh, …). Commands use
+  `$(...)`, which csh and tcsh reject; the `engine-builder` check then refuses
+  with the shell's error rather than running anything.
 
 ## What it does not do
 

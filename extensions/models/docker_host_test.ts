@@ -1,10 +1,15 @@
-import { assertEquals } from "jsr:@std/assert@1";
+import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1";
 import {
   builderPruneCommand,
+  ENGINE_BUILDER_INSPECT,
+  engineBuilderProblem,
+  type Exec,
   execArgv,
+  type ExecResult,
   humanBytes,
   type ImageRow,
   LOCAL_HOST,
+  model,
   parseDf,
   parseImages,
   parseSize,
@@ -348,10 +353,205 @@ Deno.test("humanBytes renders round units", () => {
 Deno.test("builderPruneCommand keeps -a and the age filter", () => {
   assertEquals(
     builderPruneCommand(168),
-    "docker builder prune -af --filter until=168h",
+    'docker buildx prune --builder "$(docker context show)" -af --filter until=168h',
   );
 });
 
 Deno.test("builderPruneCommand with 0 hours prunes all unused cache", () => {
-  assertEquals(builderPruneCommand(0), "docker builder prune -af");
+  assertEquals(
+    builderPruneCommand(0),
+    'docker buildx prune --builder "$(docker context show)" -af',
+  );
+});
+
+// --- engineBuilderProblem --------------------------------------------------
+// The prune must land on the engine this model measures. Anything but a clean
+// inspect reporting the docker driver is a refusal.
+
+const ok = (stdout: string): ExecResult => ({ code: 0, stdout, stderr: "" });
+
+Deno.test("engineBuilderProblem accepts the engine's docker-driver builder", () => {
+  assertEquals(
+    engineBuilderProblem(ok("Name:          default\nDriver:        docker\n")),
+    null,
+  );
+});
+
+Deno.test("engineBuilderProblem refuses a docker-container builder", () => {
+  const p = engineBuilderProblem(
+    ok("Name:   ci\nDriver: docker-container\n"),
+  );
+  assert(p?.includes('"docker-container"'));
+});
+
+Deno.test("engineBuilderProblem fails closed on a failed or unparseable inspect", () => {
+  const failed = engineBuilderProblem({
+    code: 1,
+    stdout: "",
+    stderr: "docker: 'buildx' is not a docker command.",
+  });
+  assert(failed?.includes("exit 1"));
+  assert(engineBuilderProblem(ok("nothing useful"))?.includes('"unknown"'));
+});
+
+// --- methods against a fake host ---------------------------------------------
+// Every command goes through one Exec, so these assert exactly what a host
+// would be sent: what reclaim deletes, in what order, and what it never runs.
+
+const HOST_DF = [
+  "Filesystem 1024-blocks Used Available Capacity Mounted on",
+  "/dev/sda3 206435328 167772160 30408704 85% /",
+].join("\n");
+
+// Newest first, as `docker images` prints: app:v3 is in use, app:v2 is the
+// kept version (keepVersions 1), app:v1 is removable, and one is dangling.
+const HOST_IMAGES = [
+  "aaa000000001\tapp\tv3\t2026-10-03 10:00:00 +0000 UTC\t500MB",
+  "aaa000000002\tapp\tv2\t2026-10-02 10:00:00 +0000 UTC\t500MB",
+  "aaa000000003\tapp\tv1\t2026-10-01 10:00:00 +0000 UTC\t400MB",
+  "bbb000000001\t<none>\t<none>\t2026-09-01 10:00:00 +0000 UTC\t1GB",
+].join("\n");
+
+function fakeHost(overrides: Record<string, ExecResult> = {}) {
+  const calls: string[] = [];
+  const responses: Array<[string, ExecResult]> = [
+    ...Object.entries(overrides),
+    ["docker system df", ok(DF_JSON)],
+    ["df -Pk", ok(HOST_DF)],
+    ["docker images", ok(HOST_IMAGES)],
+    ["docker ps -aq", ok("c1\n")],
+    ["docker inspect", ok("sha256:aaa000000001" + "f".repeat(52) + "\n")],
+    ["docker rmi", ok("")],
+    ["docker buildx prune", ok("Total: 1.3GB")],
+    [ENGINE_BUILDER_INSPECT, ok("Name: default\nDriver: docker\n")],
+  ];
+  const exec: Exec = (command) => {
+    calls.push(command);
+    const hit = responses.find(([prefix]) => command.startsWith(prefix));
+    return Promise.resolve(
+      hit?.[1] ?? { code: 127, stdout: "", stderr: `unexpected: ${command}` },
+    );
+  };
+  return { exec, calls };
+}
+
+function fakeContext(exec: Exec) {
+  const writes: Array<{ resource: string; data: Record<string, unknown> }> = [];
+  const context = {
+    globalArgs: {
+      sshHost: "host.example.com",
+      sshUser: "deploy",
+      keepVersions: 1,
+      buildCacheKeepHours: 168,
+      dataRoot: "/var/lib/docker",
+      strictHostKeyChecking: "accept-new",
+    },
+    logger: { info: () => {} },
+    writeResource: (resource: string, _i: string, data: unknown) => {
+      writes.push({ resource, data: data as Record<string, unknown> });
+      return Promise.resolve();
+    },
+    _exec: exec,
+  };
+  return { context, writes };
+}
+
+const destructive = (calls: string[]) =>
+  calls.filter((c) => c.startsWith("docker rmi") || c.includes(" prune"));
+
+Deno.test("reclaim without apply sends no destructive command", async () => {
+  const { exec, calls } = fakeHost();
+  const { context, writes } = fakeContext(exec);
+  await model.methods.reclaim.execute({ apply: false }, context);
+  assertEquals(destructive(calls), []);
+  assertEquals(writes.map((w) => w.resource), ["reclaim"]);
+  assertEquals(writes[0].data.applied, false);
+});
+
+Deno.test("reclaim prunes the engine's cache, then removes only planned images", async () => {
+  const { exec, calls } = fakeHost();
+  const { context, writes } = fakeContext(exec);
+  await model.methods.reclaim.execute({ apply: true }, context);
+  assertEquals(destructive(calls), [
+    builderPruneCommand(168),
+    "docker rmi aaa000000003",
+    "docker rmi bbb000000001",
+  ]);
+  assertEquals(writes[0].data.applied, true);
+  assertEquals(writes[0].data.imagesRemoved, 2);
+});
+
+Deno.test("reclaim counts a refused rmi and carries on", async () => {
+  const { exec } = fakeHost({
+    "docker rmi aaa000000003": {
+      code: 1,
+      stdout: "",
+      stderr: "image has dependent child images",
+    },
+  });
+  const { context, writes } = fakeContext(exec);
+  await model.methods.reclaim.execute({ apply: true }, context);
+  assertEquals(writes[0].data.imagesRemoved, 1);
+  assertEquals(writes[0].data.imagesFailed, 1);
+});
+
+Deno.test("reclaim deletes no image and writes nothing when the prune fails", async () => {
+  const { exec, calls } = fakeHost({
+    "docker buildx prune": { code: 1, stdout: "", stderr: "no such builder" },
+  });
+  const { context, writes } = fakeContext(exec);
+  await assertRejects(
+    () => model.methods.reclaim.execute({ apply: true }, context),
+    Error,
+    "no such builder",
+  );
+  assertEquals(destructive(calls), [builderPruneCommand(168)]);
+  assertEquals(writes, []);
+});
+
+Deno.test("reclaim deletes nothing when the measurement fails", async () => {
+  const { exec, calls } = fakeHost({
+    "df -Pk": { code: 1, stdout: "", stderr: "No such file or directory" },
+  });
+  const { context, writes } = fakeContext(exec);
+  await assertRejects(() =>
+    model.methods.reclaim.execute({ apply: true }, context)
+  );
+  assertEquals(destructive(calls), []);
+  assertEquals(writes, []);
+});
+
+Deno.test("plan is read-only and reports the protected images", async () => {
+  const { exec, calls } = fakeHost();
+  const { context, writes } = fakeContext(exec);
+  await model.methods.plan.execute({}, context);
+  assertEquals(destructive(calls), []);
+  const plan = writes[0].data as {
+    images: Array<{ id: string }>;
+    protectedImages: Array<{ id: string; reason: string }>;
+  };
+  assertEquals(plan.images.map((i) => i.id), ["aaa000000003", "bbb000000001"]);
+  assertEquals(plan.protectedImages.map((p) => p.reason), [
+    "in-use",
+    "kept-version",
+  ]);
+});
+
+Deno.test("engine-builder check passes on the docker driver, scoped to reclaim", async () => {
+  const check = model.checks["engine-builder"];
+  assertEquals(check.appliesTo, ["reclaim"]);
+  const { exec, calls } = fakeHost();
+  const { context } = fakeContext(exec);
+  assertEquals(await check.execute(context), { pass: true });
+  assertEquals(calls, [ENGINE_BUILDER_INSPECT]);
+});
+
+Deno.test("engine-builder check refuses a builder that is not the engine's", async () => {
+  const { exec } = fakeHost({
+    [ENGINE_BUILDER_INSPECT]: ok("Name: ci\nDriver: docker-container\n"),
+  });
+  const { context } = fakeContext(exec);
+  const result = await model.checks["engine-builder"].execute(context);
+  assertEquals(result.pass, false);
+  assert(result.errors?.[0].startsWith("deploy@host.example.com: "));
 });
